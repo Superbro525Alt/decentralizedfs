@@ -4,70 +4,84 @@ mod network;
 
 /*--------------*/
 
-use std::{io, thread, time::Duration};
+use std::{fs, io::{self, Write}, thread, time::Duration};
 use chunk::{chunk_file, recompile_file, ChunkSize};
-use log::error;
-use node::Node;
+use log::{error, info};
+use node::{create_node, request_file, verify_integrity, Node};
 use uuid::Uuid; 
+
+const NUM_NODES: usize = 2;
+const FILES: [&str; 4] = ["file1.dat" , "file2.dat", "file3.dat", "file4.dat"];
+const FILE_SIZE: usize = 10 * 1024; // 10KB
+
+fn create_files() {
+    for (i, &file_name) in FILES.iter().enumerate() {
+        if !fs::metadata(file_name).is_ok() {
+            let mut file = fs::File::create(file_name).expect("Failed to create file");
+            let content = vec![(i as u8 + b'A'); FILE_SIZE]; // Fill each file with repeating pattern (A, B, C, D)
+            file.write_all(&content).expect("Failed to write to file");
+            info!("Created file: {}", file_name);
+        } else {
+            info!("File {} already exists", file_name);
+        }
+    }
+}
 
 fn main() {
     env_logger::init();
 
-    let mut node1 = Node::new("127.0.0.1".to_string(), 8080);
-    let mut node2 = Node::new("127.0.0.1".to_string(), 8081);
-    // let mut node3 = Node::new("127.0.0.1".to_string(), 8082); 
+    create_files();
 
-    node1.add_peer("127.0.0.1:8081".to_string());
-    // node1.add_peer("127.0.0.1:8082".to_string());
+     // Create 20 nodes with different ports and link them as peers
+    let mut nodes = Vec::new();
+    for i in 0..NUM_NODES {
+        let port = 8080 + i as u16;
+        let peer_ports: Vec<String> = (0..NUM_NODES)
+            .filter(|&p| p != i)
+            .map(|p| format!("127.0.0.1:{}", 8080 + p as u16))
+            .collect();
 
-    node2.add_peer("127.0.0.1:8080".to_string());
-    // node2.add_peer("127.0.0.1:8082".to_string());
-
-    // node3.add_peer("127.0.0.1:8080".to_string());
-    // node3.add_peer("127.0.0.1:8081".to_string());
-
-    let node1_clone = node1.clone();
-    let node2_clone = node2.clone();
-    // let node3_clone = node3.clone(); 
-
-    thread::spawn(move || {
-        node1_clone.start_listener();
-    });
-
-    thread::spawn(move || {
-        node2_clone.start_listener();
-    });
-
-    // thread::spawn(move || {
-    //     node3_clone.start_listener();
-    // });
-
-    thread::sleep(Duration::from_millis(500));
-
-    let file_path = "large_file.dat"; 
-    let chunk_size = chunk::ChunkSize::KB1; 
-
-    let uid = node1.chunk_and_distribute_file(file_path, chunk_size);
-    if let Err(e) = uid { return; }
-
-    thread::sleep(Duration::from_millis(1000));
-
-    let output_file = "recombined_file_node";
-    
-    if let Err(e) = node1.recompile_file(*uid.as_ref().unwrap(), &format!("{}1.dat", output_file)) {
-        error!("Error recompiling file on node1: {}", e);
-        return;
+        let node = create_node("127.0.0.1", port, peer_ports);
+        nodes.push(node);
     }
 
-    if let Err(e) = node2.recompile_file(*uid.as_ref().unwrap(), &format!("{}2.dat", output_file)) {
-        error!("Error recompiling file on node2: {}", e);
-        return;
+    info!("Created nodes");
+
+    // Distribute 4 different files across the nodes
+    let chunk_size = ChunkSize::KB1;
+    let mut file_uuids = Vec::new();
+
+    for (i, &file) in FILES.iter().enumerate() {
+        info!("Distributing files ({})", i);
+        let node_index = i % NUM_NODES; // Choose the node to distribute the file
+        let node = nodes[node_index].clone();
+        info!("Selected node");
+
+        // let file_uuid = {
+            let file_uuid = node.chunk_and_distribute_file(file, chunk_size).unwrap();
+        // };
+
+        info!("File UUID: {}", file_uuid);
+        file_uuids.push(file_uuid);
+        thread::sleep(Duration::from_secs(2)); // Allow time for distribution
     }
 
-    // if let Err(e) = node3.recompile_file(*uid.as_ref().unwrap(), &format!("{}3.dat", output_file)) {
-    //     error!("Error recompiling file on node3: {}", e);
-    //     return;
-    // }
+    // Recombine the files on all nodes and check integrity
+    for (i, &file_uuid) in file_uuids.iter().enumerate() {
+        let original_file = FILES[i];
+        for node_index in 0..NUM_NODES {
+            let output_file = format!("recombined_file_node{}_{}.dat", node_index + 1, i + 1);
+            let node = nodes[node_index].clone();
 
-    // loop {}
+            if let Err(e) = request_file(node, file_uuid, &output_file) {
+                error!("Error recompiling file on node {}: {}", node_index + 1, e);
+            } else {
+                if verify_integrity(original_file, &output_file) {
+                    info!("Node {} successfully recombined file {}", node_index + 1, original_file);
+                } else {
+                    error!("Node {} failed integrity check for file {}", node_index + 1, original_file);
+                }
+            }
+        }
+    }
 }
