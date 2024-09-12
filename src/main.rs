@@ -11,7 +11,7 @@ use node::{create_node, request_file, verify_integrity, Node};
 use uuid::Uuid; 
 
 const NUM_NODES: usize = 2;
-const FILES: [&str; 4] = ["file1.dat" , "file2.dat", "file3.dat", "file4.dat"];
+const FILES: [&str; 4] = ["file1.dat", "file2.dat", "file3.dat", "file4.dat"];
 const FILE_SIZE: usize = 10 * 1024; // 10KB
 
 fn create_files() {
@@ -41,6 +41,7 @@ fn main() {
             .map(|p| format!("127.0.0.1:{}", 8080 + p as u16))
             .collect();
 
+        println!("{:?}", peer_ports);
         let node = create_node("127.0.0.1", port, peer_ports);
         nodes.push(node);
     }
@@ -57,9 +58,7 @@ fn main() {
         let node = nodes[node_index].clone();
         info!("Selected node");
 
-        // let file_uuid = {
-            let file_uuid = node.chunk_and_distribute_file(file, chunk_size).unwrap();
-        // };
+        let file_uuid = node.chunk_and_distribute_file(file, chunk_size).unwrap();
 
         info!("File UUID: {}", file_uuid);
         file_uuids.push(file_uuid);
