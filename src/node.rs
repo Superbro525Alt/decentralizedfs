@@ -2,15 +2,16 @@ use std::error::Error;
 use std::fs::{self, File};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
 use std::thread;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 use serde::{Serialize, Deserialize};
 use uuid::Uuid;
 use std::io::{self, Read, Write};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use bincode;
 use log::{info, warn, error};
+use std::collections::VecDeque;
 
 use crate::chunk;
 use crate::network::Message;
@@ -20,28 +21,20 @@ pub struct Node {
     pub uuid: Uuid,
     ip: String,
     port: u16,
-    pub files: Arc<Mutex<HashMap<Uuid, SplitFile>>>, 
-    peers: Arc<Mutex<HashSet<String>>>, // Use HashSet for peers to avoid duplicates
-    pub chunk_requests: Arc<Mutex<HashMap<Uuid, HashSet<usize>>>>, // Track which chunks are requested by each file
-    request_queue: Arc<Mutex<VecDeque<ChunkRequest>>>, // Request queue for chunks
+    pub files: Arc<Mutex<HashMap<Uuid, SplitFile>>>,
+    peers: Vec<String>,
+    chunk_requests: Arc<Mutex<HashMap<(Uuid, usize), String>>>, // Keeps track of which peer is requesting which chunk
+    request_queue: Arc<Mutex<VecDeque<(Uuid, usize)>>>,          // Queue for managing requests
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SplitFile {
     file_name: String,
     total_chunks: usize,
-    stored_chunks: HashMap<usize, Vec<u8>>, 
+    stored_chunks: HashMap<usize, Vec<u8>>,
     uuid: Uuid,
-    parity_chunks: usize,
-    is_complete: bool,
-}
-
-#[derive(Debug, Clone)]
-struct ChunkRequest {
-    file_uuid: Uuid,
-    chunk_index: usize,
-    peer: String,
-    requested_at: Instant,
+    parity_chunks: usize, // Number of parity chunks generated
+    is_complete: bool,    // Whether the file is complete (all chunks received)
 }
 
 impl Node {
@@ -51,7 +44,7 @@ impl Node {
             ip,
             port,
             files: Arc::new(Mutex::new(HashMap::new())),
-            peers: Arc::new(Mutex::new(HashSet::new())), 
+            peers: Vec::new(),
             chunk_requests: Arc::new(Mutex::new(HashMap::new())),
             request_queue: Arc::new(Mutex::new(VecDeque::new())),
         }
@@ -63,16 +56,25 @@ impl Node {
 
         info!("Node listening on port {}", self.port);
 
-        let storage_dir = self.create_storage_directory().unwrap(); 
+        let storage_dir = self.create_storage_directory().unwrap();
 
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
                     let files = self.files.clone();
-                    let storage_dir_clone = storage_dir.clone(); 
+                    let storage_dir_clone = storage_dir.clone();
                     let uuid = self.uuid.clone();
+                    let chunk_requests = self.chunk_requests.clone();
+                    let request_queue = self.request_queue.clone();
                     thread::spawn(move || {
-                        handle_connection(stream, files, &storage_dir_clone, uuid);
+                        handle_connection(
+                            stream,
+                            files,
+                            &storage_dir_clone,
+                            uuid,
+                            chunk_requests,
+                            request_queue,
+                        );
                     });
                 }
                 Err(e) => {
@@ -83,8 +85,8 @@ impl Node {
     }
 
     fn create_storage_directory(&self) -> io::Result<PathBuf> {
-        let mut storage_path = PathBuf::from("./decentralizedfs"); 
-        storage_path.push(self.uuid.to_string()); 
+        let mut storage_path = PathBuf::from("./decentralizedfs");
+        storage_path.push(self.uuid.to_string());
 
         if !storage_path.exists() {
             fs::create_dir_all(&storage_path)?;
@@ -114,23 +116,19 @@ impl Node {
         Ok(())
     }
 
-    pub fn add_peer(&self, peer_address: String) {
-        let mut peers = self.peers.lock().unwrap();
-        peers.insert(peer_address);
+    pub fn add_peer(&mut self, peer_address: String) {
+        self.peers.push(peer_address);
     }
 
-    // Sync with peers: Request metadata and missing chunks
     pub fn sync_with_peer(&self, peer_address: &str, file_uuid: Uuid) -> io::Result<()> {
         let message = Message::Sync { file_uuid };
         self.connect_to_peer(peer_address, message)?;
         Ok(())
     }
 
-    // Handle the FileComplete message: Broadcast to peers that file is complete
     pub fn broadcast_file_complete(&self, file_uuid: Uuid) -> io::Result<()> {
         let message = Message::FileComplete { file_uuid };
-        let peers = self.peers.lock().unwrap();
-        for peer in peers.iter() {
+        for peer in &self.peers {
             self.connect_to_peer(peer, message.clone())?;
             info!("Notified peer {} that file {} is complete", peer, file_uuid);
         }
@@ -138,15 +136,14 @@ impl Node {
     }
 
     pub fn chunk_and_distribute_file(&self, file_path: &str, chunk_size: chunk::ChunkSize) -> io::Result<Uuid> {
-        let storage_dir = self.create_storage_directory()?; 
-
+        let storage_dir = self.create_storage_directory()?;
         let chunk_collection = chunk::chunk_file(file_path, chunk_size, &storage_dir)?;
         let num_parity_chunks = chunk_collection.parity_chunks;
         let total_chunks = chunk_collection.num_chunks + num_parity_chunks;
 
         info!("Total chunks created: {}, Parity chunks: {}", chunk_collection.num_chunks, num_parity_chunks);
 
-        let peers_count = self.peers.lock().unwrap().len();
+        let peers_count = self.peers.len();
         if peers_count == 0 {
             warn!("No peers to distribute chunks to.");
         }
@@ -186,16 +183,15 @@ impl Node {
         }
 
         if peers_count > 0 {
-            let mut handles = Vec::new(); 
-
-            for peer in self.peers.lock().unwrap().iter() {
-                let peer = peer.clone();
+            let mut handles = Vec::new();
+            for peer_index in 0..peers_count {
+                let peer = self.peers[peer_index].clone();
                 let files = self.files.clone();
                 let storage_dir_clone = storage_dir.clone();
                 let chunk_collection_uuid = chunk_collection.uuid;
 
                 let handle = thread::spawn(move || {
-                    for i in 0..chunk_collection.num_chunks {
+                    for i in (peer_index..chunk_collection.num_chunks).step_by(peers_count) {
                         let chunk_filename = format!("{}_chunk_{}.dat", chunk_collection_uuid, i);
                         let chunk_path = storage_dir_clone.join(&chunk_filename);
 
@@ -227,7 +223,6 @@ impl Node {
         }
 
         self.broadcast_parity_chunk(chunk_collection.uuid, chunk_collection.num_chunks, &storage_dir, num_parity_chunks)?;
-
         {
             let mut files_lock = self.files.lock().unwrap();
             if let Some(file) = files_lock.get_mut(&chunk_collection.uuid) {
@@ -260,7 +255,7 @@ impl Node {
             let mut buffer = Vec::new();
             parity_chunk_file.read_to_end(&mut buffer)?;
 
-            for peer in self.peers.lock().unwrap().iter() {
+            for peer in &self.peers {
                 match Node::connect_to_peer_static(peer, Message::ChunkResponse {
                     file_uuid,
                     chunk_index,
@@ -308,10 +303,10 @@ impl Node {
     }
 
     fn store_chunk_in_file(&self, file_uuid: Uuid, chunk_index: usize, chunk_data: Vec<u8>) -> io::Result<()> {
-        let storage_path = self.create_storage_directory()?; 
+        let storage_path = self.create_storage_directory()?;
 
         let chunk_filename = format!("{}_chunk_{}.dat", file_uuid, chunk_index);
-        let chunk_path = storage_path.join(&chunk_filename); 
+        let chunk_path = storage_path.join(&chunk_filename);
 
         let mut chunk_file = File::create(&chunk_path)?;
         chunk_file.write_all(&chunk_data)?;
@@ -321,8 +316,7 @@ impl Node {
     }
 
     pub fn recompile_file(&self, file_uuid: Uuid, output_file: &str) -> io::Result<()> {
-        let files_clone = self.files.clone(); 
-        
+        let files_clone = self.files.clone();
         let stored_chunks_count;
         let total_chunks;
         let parity_chunks;
@@ -412,7 +406,7 @@ impl Node {
         }
 
         for chunk_index in missing_chunks {
-            for peer in self.peers.lock().unwrap().iter() {
+            for peer in &self.peers {
                 info!("Requesting chunk {} for file {} from peer {}", chunk_index, file_uuid, peer);
                 self.request_chunk(peer, file_uuid, chunk_index)?;
             }
@@ -457,6 +451,80 @@ impl Node {
     }
 }
 
+fn handle_connection(
+    mut stream: TcpStream,
+    files: Arc<Mutex<HashMap<Uuid, SplitFile>>>,
+    path: &PathBuf,
+    uuid: Uuid,
+    chunk_requests: Arc<Mutex<HashMap<(Uuid, usize), String>>>,
+    request_queue: Arc<Mutex<VecDeque<(Uuid, usize)>>>,
+) {
+    match Message::receive(&mut stream) {
+        Ok(Message::ChunkRequest { file_uuid, chunk_index }) => {
+            let mut chunk_requests_lock = chunk_requests.lock().unwrap();
+            if let Some(requesting_peer) = chunk_requests_lock.get(&(file_uuid, chunk_index)) {
+                warn!("Chunk {} for file {} is already being requested by {}", chunk_index, file_uuid, requesting_peer);
+                return;
+            }
+
+            let files_lock = files.lock().unwrap();
+            if let Some(file) = files_lock.get(&file_uuid) {
+                if let Some(chunk) = file.stored_chunks.get(&chunk_index) {
+                    let response = Message::ChunkResponse {
+                        file_uuid,
+                        chunk_index,
+                        chunk_data: chunk.clone(),
+                        total_chunks: file.total_chunks,
+                        parity_chunks: file.parity_chunks,
+                        is_parity_chunk: false,
+                    };
+                    response.send(&mut stream).expect("Failed to send chunk");
+                    info!("Sent chunk {} for file {} to peer (from {})", chunk_index, file_uuid, uuid);
+                    chunk_requests_lock.insert((file_uuid, chunk_index), uuid.to_string());
+                } else {
+                    warn!("Requested chunk {} for file {} is missing", chunk_index, file_uuid);
+                }
+            }
+        }
+        Ok(Message::ChunkResponse {
+            file_uuid,
+            chunk_index,
+            chunk_data,
+            total_chunks,
+            parity_chunks,
+            is_parity_chunk,
+        }) => {
+            info!("Received chunk {} for file {}", chunk_index, file_uuid);
+            handle_chunk_response(
+                files.clone(),
+                file_uuid,
+                chunk_index,
+                chunk_data,
+                path,
+                total_chunks,
+                parity_chunks,
+                is_parity_chunk,
+            );
+        }
+        Ok(Message::FileComplete { file_uuid }) => {
+            info!("File {} is complete", file_uuid);
+            let mut files_lock = files.lock().unwrap();
+            if let Some(file) = files_lock.get_mut(&file_uuid) {
+                file.is_complete = true;
+                info!("File {} is marked as complete", file_uuid);
+            }
+        }
+        Ok(Message::Sync { file_uuid }) => {
+            info!("Sync request for file {}", file_uuid);
+            let files_lock = files.lock().unwrap();
+            if let Some(file) = files_lock.get(&file_uuid) {
+                info!("Syncing file {} with peer", file_uuid);
+            }
+        }
+        Err(e) => error!("Error handling connection: {}", e),
+    }
+}
+
 fn handle_chunk_response(
     files: Arc<Mutex<HashMap<Uuid, SplitFile>>>,
     file_uuid: Uuid,
@@ -486,7 +554,7 @@ fn handle_chunk_response(
                     stored_chunks,
                     uuid: file_uuid,
                     parity_chunks: 0,
-                    is_complete: false
+                    is_complete: false,
                 };
 
                 files_lock.insert(file_uuid, new_file);
@@ -514,67 +582,28 @@ fn handle_chunk_response(
     if let Err(e) = File::create(&chunk_path).and_then(|mut file| file.write_all(&chunk_data)) {
         error!("Failed to write chunk {} for file {} to disk: {}", chunk_index, file_uuid, e);
     } else {
-        info!("Successfully saved chunk {} for file {} to {:?}", chunk_index, file_uuid, chunk_path);
-    }
-}
-
-fn handle_connection(mut stream: TcpStream, files: Arc<Mutex<HashMap<Uuid, SplitFile>>>, path: &PathBuf, uuid: Uuid) {
-    match Message::receive(&mut stream) {
-        Ok(Message::ChunkRequest { file_uuid, chunk_index }) => {
-            let files_lock = files.lock().unwrap();
-            if let Some(file) = files_lock.get(&file_uuid) {
-                if let Some(chunk) = file.stored_chunks.get(&chunk_index) {
-                    let response = Message::ChunkResponse {
-                        file_uuid,
-                        chunk_index,
-                        chunk_data: chunk.clone(),
-                        total_chunks: file.total_chunks,
-                        parity_chunks: file.parity_chunks,
-                        is_parity_chunk: false,
-                    };
-                    response.send(&mut stream).expect("Failed to send chunk");
-                    info!("Sent chunk {} for file {} to peer (from {})", chunk_index, file_uuid, uuid);
-                } else {
-                    warn!("Requested chunk {} for file {} is missing", chunk_index, file_uuid);
-                }
-            }
-        }
-        Ok(Message::ChunkResponse { file_uuid, chunk_index, chunk_data, total_chunks, parity_chunks, is_parity_chunk }) => {
-            info!("Received chunk {} for file {}", chunk_index, file_uuid);
-            handle_chunk_response(files.clone(), file_uuid, chunk_index, chunk_data, path, total_chunks, parity_chunks, is_parity_chunk);
-        }
-        Ok(Message::FileComplete { file_uuid }) => {
-            info!("File {} is complete", file_uuid);
-            let mut files_lock = files.lock().unwrap();
-            if let Some(file) = files_lock.get_mut(&file_uuid) {
-                file.is_complete = true;
-                info!("File {} is marked as complete", file_uuid);
-            }
-        }
-        Ok(Message::Sync { file_uuid }) => {
-            info!("Sync request for file {}", file_uuid);
-            let files_lock = files.lock().unwrap();
-            if let Some(file) = files_lock.get(&file_uuid) {
-                info!("Syncing file {} with peer", file_uuid);
-            }
-        }
-        Err(e) => error!("Error handling connection: {}", e),
+        info!(
+            "Successfully saved chunk {} for file {} to {:?}",
+            chunk_index, file_uuid, chunk_path
+        );
     }
 }
 
 pub fn create_node(ip: &str, port: u16, peer_addresses: Vec<String>) -> Node {
     let mut node = Node::new(ip.to_string(), port);
 
+    // Clone the Arc so we can move it into the thread
     let node_clone = node.clone();
 
+    // Start the node listener in a separate thread
     thread::spawn(move || {
         node_clone.start_listener();
     });
 
+    // Add peers to the node
     {
-        let mut peers = node.peers.lock().unwrap();
         for peer_address in peer_addresses {
-            peers.insert(peer_address);
+            node.add_peer(peer_address);
         }
     }
 
@@ -584,7 +613,7 @@ pub fn create_node(ip: &str, port: u16, peer_addresses: Vec<String>) -> Node {
 pub fn request_file_from_network(node: Arc<Mutex<Node>>, file_uuid: Uuid, output_file: &str) -> Result<(), Box<dyn Error>> {
     {
         let node_locked = node.lock().unwrap();
-        for peer in node_locked.peers.lock().unwrap().iter() {
+        for peer in &node_locked.peers {
             node_locked.sync_with_peer(peer, file_uuid)?;
         }
     }

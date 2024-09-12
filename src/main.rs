@@ -9,8 +9,8 @@ use chunk::ChunkSize;
 use log::{error, info};
 use node::{create_node, request_file, verify_integrity};
 
-const NUM_NODES: usize = 300;
-const FILE_COUNT: usize = 50;
+const NUM_NODES: usize = 2;
+const FILE_COUNT: usize = 30;
 const FILE_SIZE: usize = 100 * 1024; // 10KB
 
 fn create_files(file_count: usize) {
