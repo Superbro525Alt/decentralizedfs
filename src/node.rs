@@ -634,7 +634,7 @@ pub fn create_node(ip: &str, port: u16, peer_addresses: Vec<String>) -> Node {
     }
 
     // Give some time for the listener to start and peers to connect
-    thread::sleep(Duration::from_secs_f64(0.2));
+    // thread::sleep(Duration::from_secs_f64(0.2));
 
     node
 }
@@ -649,7 +649,7 @@ pub fn request_file_from_network(node: Arc<Mutex<Node>>, file_uuid: Uuid, output
     }
 
     // Give some time for peers to respond with missing chunks
-    thread::sleep(Duration::from_secs(5));
+    // thread::sleep(Duration::from_secs(5));
 
     // Attempt to recompile the file once all chunks (data + parity) are available
     {

@@ -11,7 +11,7 @@ use node::{create_node, request_file, verify_integrity, Node};
 use uuid::Uuid; 
 
 const NUM_NODES: usize = 2;
-const FILES: [&str; 4] = ["file1.dat", "file2.dat", "file3.dat", "file4.dat"];
+const FILES: [&str; 6] = ["file1.dat", "file2.dat", "file3.dat", "file4.dat", "file5.dat", "file6.dat"];
 const FILE_SIZE: usize = 10 * 1024; // 10KB
 
 fn create_files() {
@@ -62,7 +62,6 @@ fn main() {
 
         info!("File UUID: {}", file_uuid);
         file_uuids.push(file_uuid);
-        thread::sleep(Duration::from_secs(2)); // Allow time for distribution
     }
 
     // Recombine the files on all nodes and check integrity
